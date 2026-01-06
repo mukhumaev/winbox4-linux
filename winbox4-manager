@@ -1,0 +1,377 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+function std_err(){
+    echo -e "$*" 1>&2
+}
+
+function silent(){
+    eval "$*" > /dev/null 2>&1
+}
+
+function cmd_exists(){
+    silent type -P "$1"
+}
+
+function check_arch(){
+    local arch supported_arch
+
+    arch="$(uname -m)"
+    supported_arch="x86_64"
+
+    if [ "$arch" != "$supported_arch" ]; then
+        std_err "ERROR: unsupported architecture"
+        std_err "Your arch: $arch"
+        std_err "Support only: $supported_arch"
+        return 1
+    fi
+}
+
+function check_root(){
+    local uid
+
+    uid="$(id -u)"
+
+    if [ "$uid" -ne 0 ]; then
+        std_err "You need run script under root or sudo"
+        return 1
+    fi
+}
+
+function check_depends(){
+    local depend_list=("$@")
+    local not_found=()
+    local dep
+    local pm
+
+    for dep in "${depend_list[@]}"; do
+        if ! cmd_exists "$dep" >/dev/null 2>&1; then
+            not_found+=("$dep")
+        fi
+    done
+    if ((${#not_found[@]})); then
+        std_err "WARN! Missing dependencies: ${not_found[*]}"
+        std_err "Trying to install missing dependencies ..."
+
+        pm=$(
+            type -P pacman \
+            || type -P apk \
+            || type -P apt \
+            || type -P dnf
+        )
+
+        case "$pm" in
+        pacman) $pm pacman -Syu && pacman -S --needed ${not_found[*]} ;;
+        apk) $pm add ${not_found[*]} ;;
+        apt) $pm update && $pm install -y ${not_found[*]} ;;
+        dnf) $pm install -y ${not_found[*]} ;;
+        *)
+            std_err "Unsupported package manager. Install dependencies manually, then retry"
+
+            return 1
+        ;;
+        esac || return 1
+    fi
+}
+
+function winbox4_permission(){
+    local arg="$1"
+    local target_dir="${2:-$TARGET_DIR}"
+    local user=winbox4
+    local group="$user"
+
+    case "$arg" in
+    install)
+        if ! silent id "$user"; then
+            if cmd_exists useradd; then
+                useradd -M -s /usr/sbin/nologin -c "winbox4 user" "$user"
+                usermod -aG $group "$SUDO_USER"
+            elif cmd_exists adduser; then
+                adduser --disabled-login --gecos "winbox4 user" --shell /usr/sbin/nologin --no-create-home "$user"
+                adduser "$SUDO_USER" $group
+            fi
+        fi
+
+        chmod -R 775 "$target_dir"
+        find "$target_dir"/* -type f -executable -print0 | xargs -0 -r chmod 0775
+        chown -R "$user:$group" "$target_dir"
+    ;;
+    remove)
+        if cmd_exists deluser; then
+            deluser --remove-home $user
+            delgroup $group
+        elif cmd_exists userdel; then
+            userdel -r $user
+            groupdel $group
+        fi
+    ;;
+    esac
+}
+
+function winbox4_files(){
+    local file_action="$1"
+    local target_dir="${2:-$TARGET_DIR}"
+    local exec_file="$target_dir/winbox4.sh"
+    local uninstall_file="$target_dir/uninstall.sh"
+    local exec_link="/usr/local/bin/winbox4"
+    local desktop_file="/usr/share/applications/winbox4.desktop"
+    local icon_file="$target_dir/assets/img/winbox.png"
+
+    case "$file_action" in
+    install)
+        cat > "$exec_file" <<'EXEC_FILE'
+#!/usr/bin/env bash
+
+std_err(){
+    echo -e "$*" 1>&2
+}
+
+is_root(){
+   [ $(id -u) -eq 0 ]
+}
+
+silent(){
+    eval "$*" > /dev/null 2>&1
+}
+
+is_wayland(){
+  local session_type
+
+  if [ -n "${XDG_SESSION_TYPE-}" ]; then
+    session_type="${XDG_SESSION_TYPE,,}"
+    case "$session_type" in
+      wayland) return 0 ;;
+      x11|xorg) return 1 ;;
+    esac
+  fi
+
+  [ -n "${WAYLAND_DISPLAY-}" ] && return 0
+
+  return 1
+}
+
+winbox4(){
+  local winbox4_dir="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+  local cmd="${winbox4_dir}/WinBox"
+  local source="${BASH_SOURCE[0]}"
+
+  if is_root; then
+    std_err "ERROR: you can't run this as root"
+  elif is_wayland; then
+    QT_QPA_PLATFORM=xcb $cmd "$@"
+  else
+    $cmd "$@"
+  fi | sed "s|$cmd|$source|g"
+}
+
+winbox4 "$@"
+
+EXEC_FILE
+        if [ -f "$exec_file" ]; then
+            chmod 0755 "$exec_file"
+
+            if ! [ -L "$exec_link" ]; then
+                ln -s "$exec_file" "$exec_link"
+            fi
+        else
+            std_err "ERROR: can't create exec file '$exec_file'"
+            return 1
+        fi
+
+
+        cat > "$uninstall_file" <<UNINSTALL_FILE
+#!/usr/bin/env bash
+
+std_err(){
+  echo -e "\$*" 1>&2
+}
+
+is_root(){
+  [ \$(id -u) -eq 0 ]
+}
+
+remove_files(){
+  echo "Removing winbox files ..."
+  if [ -L "$exec_link" ]; then
+    if ! rm -f -- "$exec_link"; then
+      std_err "ERROR: failed to remove exec link '$exec_link'"
+    fi
+  fi
+
+  if [ -f "$desktop_file" ]; then
+    if ! rm -f -- "$desktop_file"; then
+      std_err "ERROR: failed to remove desktop file '$desktop_file'"
+    fi
+  fi
+
+  if [ -d "$target_dir" ]; then
+    if ! rm -rf -- "$target_dir"; then
+      std_err "ERROR: failed to remove Winbox directory '$target_dir'"
+    fi
+  fi
+  echo "Done"
+}
+
+main(){
+  if ! is_root; then
+    std_err "You need run script under root or sudo"
+    return 1
+  fi
+
+  remove_files
+}
+
+main "\$@"
+
+UNINSTALL_FILE
+        if [ -f "$uninstall_file" ]; then
+            chmod 0755 "$uninstall_file"
+        else
+            std_err "ERROR: can't create uninstall file '$uninstall_file'"
+            return 1
+        fi
+
+        if [ -d "$(dirname "$desktop_file")" ]; then
+            cat > "$desktop_file" <<DESKTOP_FILE
+[Desktop Entry]
+Name=Winbox4
+GenericName=Configuration tool for RouterOS
+Comment=Configuration tool for RouterOS
+Exec=${exec_file}
+Icon=${icon_file}
+Terminal=false
+Type=Application
+StartupNotify=true
+StartupWMClass=WinBox
+Categories=Network;RemoteAccess;Application;
+Keywords=winbox;winbox4;mikrotik;mtik;routeros;ros;router;
+DESKTOP_FILE
+        else
+            std_err "Directory $(dirname "$desktop_file") not found"
+            std_err "Desktop file not be created"
+        fi
+    ;;
+    remove)
+        echo "Removing winbox files ..."
+        if [ -L "$exec_link" ]; then
+            if ! rm -f -- "$exec_link"; then
+                std_err "ERROR: failed to remove exec link '$exec_link'"
+            fi
+        fi
+
+        if [ -f "$desktop_file" ]; then
+            if ! rm -f -- "$desktop_file"; then
+                std_err "ERROR: failed to remove desktop file '$desktop_file'"
+            fi
+        fi
+
+        if [ -d "$target_dir" ]; then
+            if ! rm -rf -- "$target_dir"; then
+                std_err "ERROR: failed to remove Winbox directory '$target_dir'"
+            fi
+        fi
+    ;;
+    esac
+}
+
+function neighbors_firewall_rules(){
+    local arg="$1"
+
+    case "$arg" in
+    install)
+        echo "Adding neighbor rules to the firewall ..."
+        if cmd_exists ufw; then
+            silent ufw allow 5678/udp
+        elif cmd_exists firewall-cmd; then
+            silent firewall-cmd --permanent --add-port=5678/udp
+            silent firewall-cmd --reload
+        else
+            std_err "WARNING: could not detect ufw or firewalld - Neighbor rules were not installed"
+            std_err "Action required: open UDP port 5678 manually to enable Winbox Neighbor"
+        fi
+    ;;
+    remove)
+        echo "Removing neighbor rules from the firewall ..."
+        if cmd_exists ufw; then
+            silent ufw deny 5678/udp
+        elif cmd_exists firewall-cmd; then
+            silent firewall-cmd --permanent --remove-port=5678/udp
+            silent firewall-cmd --reload
+        else
+            std_err "WARNING: could not detect ufw or firewalld - Neighbor rules were not uninstalled"
+        fi
+    ;;
+    esac
+}
+
+function winbox4_fetch(){
+    local main_url="${1:-$MAIN_URL}"
+    local target_dir="${2:-$TARGET_DIR}"
+    local winbox_page winbox4_url sha256_url winbox_file sha256_file version
+
+    silent pushd "$(mktemp -d)"
+
+    winbox_page="$(curl -fsSL "$main_url")"
+
+    winbox4_url="$(echo "$winbox_page" | grep -oE 'https?://[^"'"'"' ]+Linux\.zip' | sort -Vr | head -n1)"
+    if [ -z "$winbox4_url" ]; then
+        std_err "Failed to find WinBox Linux download URL on $main_url"
+        return 1
+    fi
+
+    sha256_url="${winbox4_url}.sha256"
+    winbox_file="$(basename "$winbox4_url")"
+    sha256_file="$(basename "$sha256_url")"
+    version="$(echo "$winbox4_url" | cut -d'/' -f6)"
+
+    echo "Downloading WinBox4 version $version ..."
+    curl -fsSL "$winbox4_url" -o "$winbox_file"
+
+    echo "Downloading sha256 hash sum for WinBox4 ..."
+    curl -fsSL "$sha256_url" -o "$sha256_file"
+
+    echo "Validating hash ..."
+    sha256sum --quiet -c "$sha256_file"
+
+    echo "Extracting WinBox4 ..."
+    mkdir -p "$target_dir"
+    unzip -o "$winbox_file" -d "$target_dir" &> /dev/null
+
+    silent popd
+
+    [ -d "$target_dir" ]
+}
+
+function main(){
+    readonly MAIN_URL="https://mikrotik.com/download/winbox"
+    readonly TARGET_DIR="/opt/WinBox4"
+
+    local arg=${1:-}
+
+    check_arch
+    check_root
+
+    case "$arg" in
+    install)
+        check_depends unzip curl
+        winbox4_fetch
+        winbox4_files "$arg"
+        winbox4_permission "$arg"
+        neighbors_firewall_rules "$arg"
+    ;;
+    remove)
+        winbox4_files "$arg"
+        winbox4_permission "$arg"
+        neighbors_firewall_rules "$arg"
+    ;;
+    *)
+        std_err "Set 'install' or 'remove' argument"
+        return 1
+    ;;
+    esac
+
+    echo "Done"
+}
+
+main "$@"
